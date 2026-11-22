@@ -4,11 +4,11 @@ Build a "speaking keyboard" soundpack: every letter key plays the sound that let
 makes in English, and letter pairs such as "th", "sh" and "ee" play their own sound through the
 soundpack "sequences" feature.
 
-The clips are rendered with eSpeak NG at one fixed pitch, so consecutive keys chain into
-monotone, robotic speech. Requires `espeak-ng` and `ffmpeg` on PATH (brew install espeak-ng ffmpeg).
+The clips are rendered with eSpeak NG. Requires `espeak-ng` and `ffmpeg` on PATH
+(brew install espeak-ng ffmpeg).
 
     python3 scripts/phoneme_soundpack.py                    # install into Thock's custom soundpacks
-    python3 scripts/phoneme_soundpack.py --voice robosoft --pitch 80
+    python3 scripts/phoneme_soundpack.py --voice robosoft --pitch 80   # monotone at 80 Hz
     python3 scripts/phoneme_soundpack.py --output ./pack    # write somewhere else
 """
 
@@ -29,7 +29,7 @@ PACK_ID = "9B3E5D52-7C1F-4E0A-B8D6-2F4A61C0E7A3"
 
 DEFAULT_OUTPUT = Path.home() / "Library/Application Support/Thock/Soundpacks/speaking-keyboard"
 
-# eSpeak voice variants. Base and top pitch are forced equal by render_voice() to get a monotone.
+# eSpeak voice variants.
 VOICES = {
     "plain": "",
     "klatt": "klatt 1\n",
@@ -56,23 +56,28 @@ KINDS = {
     "vowel": (130, 20, 0.12, "rms"),
     "long": (170, 25, 0.12, "rms"),
     "glide": (190, 25, 0.12, "rms"),
-    "sonorant": (100, 15, 0.10, "rms"),
+    "sonorant": (110, 15, 0.10, "rms"),
     "fricative": (100, 12, 0.06, "rms"),
-    "voiced-fricative": (100, 15, 0.08, "rms"),
-    "affricate": (110, 12, 0.07, "rms"),
+    "voiced-fricative": (110, 15, 0.08, "rms"),
+    "affricate": (120, 12, 0.07, "rms"),
     "stop": (70, 8, 0.45, "peak"),
     "voiced-stop": (90, 15, 0.10, "rms"),
     "cluster": (140, 12, 0.45, "peak"),
 }
 
-# clip name -> (eSpeak phoneme mnemonics, kind)
+# Speaking rates to try, slowest first, in eSpeak's words per minute. A lone phoneme is rendered
+# slowly; keeping only the start of it drops the glide of a diphthong and the "r" of "ar", so
+# each clip is instead rendered at the slowest rate at which the whole sound fits its length.
+SPEEDS = (175, 200, 230, 260, 300, 350, 400, 450)
+
+# clip name -> (eSpeak phoneme mnemonics, kind), plus "head" to keep only the start of the render
 # Verify a mnemonic with: espeak-ng -v en-us --ipa -q "[[tS]]"
 CLIPS = {
     # Short vowels
     "ae": ("a", "vowel"),        # cat
     "eh": ("E", "vowel"),        # bed
     # eSpeak turns a lone "I" into "i", so render "It" and keep only the vowel
-    "ih": ("It", "vowel"),       # sit
+    "ih": ("It", "vowel", "head"),  # sit
     "o": ("0", "vowel"),         # hot
     "uh": ("V", "vowel"),        # cup
     # Long vowels and diphthongs
@@ -152,7 +157,8 @@ def decode(path: Path, sample_rate: int) -> list[float]:
     # eSpeak renders some consonants 30 dB quieter than vowels.
     threshold = peak * 0.03
     start = next(i for i, sample in enumerate(samples) if abs(sample) >= threshold)
-    return samples[start:]
+    end = len(samples) - next(i for i, sample in enumerate(reversed(samples)) if abs(sample) >= threshold)
+    return samples[start:end]
 
 
 def shape(samples: list[float], kind: str, sample_rate: int) -> list[float]:
@@ -183,21 +189,29 @@ def write_wav(path: Path, samples: list[float], sample_rate: int) -> None:
         output.writeframes(pcm.tobytes())
 
 
-def render_clips(voice: str, pitch: int, sample_rate: int) -> dict[str, list[float]]:
+def render_clips(voice: str, pitch: int | None, sample_rate: int) -> dict[str, list[float]]:
     with tempfile.TemporaryDirectory() as work:
         work_path = Path(work)
         # A custom voice variant has to live inside an eSpeak data directory
         data = work_path / "espeak-ng-data"
         shutil.copytree(espeak_data_dir(), data)
-        variant = f"language variant\nname speakingkeyboard\npitch {pitch} {pitch}\n{VOICES[voice]}"
+        # Equal base and top pitch gives a monotone; without it the voice keeps its own intonation
+        pitch_line = f"pitch {pitch} {pitch}\n" if pitch else ""
+        variant = f"language variant\nname speakingkeyboard\n{pitch_line}{VOICES[voice]}"
         (data / "voices" / "!v" / "speakingkeyboard").write_text(variant)
 
         clips = {}
-        for name, (phonemes, kind) in CLIPS.items():
+        for name, (phonemes, kind, *options) in CLIPS.items():
             source = work_path / f"{name}.wav"
-            run("espeak-ng", f"--path={work_path}", "-v", "en-us+speakingkeyboard",
-                "-w", str(source), f"[[{phonemes}]]")
-            clips[name] = shape(decode(source, sample_rate), kind, sample_rate)
+            limit = sample_rate * KINDS[kind][0] // 1000
+            samples: list[float] = []
+            for speed in SPEEDS:
+                run("espeak-ng", f"--path={work_path}", "-v", "en-us+speakingkeyboard",
+                    "-s", str(speed), "-w", str(source), f"[[{phonemes}]]")
+                samples = decode(source, sample_rate)
+                if "head" in options or len(samples) <= limit * 1.1:
+                    break
+            clips[name] = shape(samples, kind, sample_rate)
             if not clips[name]:
                 sys.exit(f"eSpeak NG produced no audio for '{name}' ([[{phonemes}]]).")
         return clips
@@ -226,7 +240,8 @@ def build_config(name: str, author: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--voice", choices=sorted(VOICES), default="klatt", help="eSpeak voice variant")
-    parser.add_argument("--pitch", type=int, default=95, help="fixed pitch of the whole bank in Hz")
+    parser.add_argument("--pitch", type=int, default=None,
+                        help="force one fixed pitch in Hz for a monotone (default: the voice's own intonation)")
     parser.add_argument("--sample-rate", type=int, default=48000, help="sample rate of the clips")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="soundpack folder to write")
     parser.add_argument("--name", default="Speaking Keyboard", help="soundpack name shown in Thock")
@@ -246,7 +261,8 @@ def main() -> None:
         write_wav(args.output / f"{name}.wav", samples, args.sample_rate)
     (args.output / "config.json").write_text(json.dumps(build_config(args.name, args.author), indent=2) + "\n")
 
-    print(f"Wrote {len(clips)} clips ({args.voice}, {args.pitch} Hz, {args.sample_rate} Hz) to {args.output}")
+    pitch = f"{args.pitch} Hz monotone" if args.pitch else "natural pitch"
+    print(f"Wrote {len(clips)} clips ({args.voice}, {pitch}, {args.sample_rate} Hz) to {args.output}")
 
 
 if __name__ == "__main__":
