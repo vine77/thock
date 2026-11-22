@@ -56,28 +56,23 @@ KINDS = {
     "vowel": (130, 20, 0.12, "rms"),
     "long": (170, 25, 0.12, "rms"),
     "glide": (190, 25, 0.12, "rms"),
-    "sonorant": (110, 15, 0.10, "rms"),
+    "sonorant": (100, 15, 0.10, "rms"),
     "fricative": (100, 12, 0.06, "rms"),
-    "voiced-fricative": (110, 15, 0.08, "rms"),
-    "affricate": (120, 12, 0.07, "rms"),
+    "voiced-fricative": (100, 15, 0.08, "rms"),
+    "affricate": (110, 12, 0.07, "rms"),
     "stop": (70, 8, 0.45, "peak"),
     "voiced-stop": (90, 15, 0.10, "rms"),
     "cluster": (140, 12, 0.45, "peak"),
 }
 
-# Speaking rates to try, slowest first, in eSpeak's words per minute. A lone phoneme is rendered
-# slowly; keeping only the start of it drops the glide of a diphthong and the "r" of "ar", so
-# each clip is instead rendered at the slowest rate at which the whole sound fits its length.
-SPEEDS = (175, 200, 230, 260, 300, 350, 400, 450)
-
-# clip name -> (eSpeak phoneme mnemonics, kind), plus "head" to keep only the start of the render
+# clip name -> (eSpeak phoneme mnemonics, kind)
 # Verify a mnemonic with: espeak-ng -v en-us --ipa -q "[[tS]]"
 CLIPS = {
     # Short vowels
     "ae": ("a", "vowel"),        # cat
     "eh": ("E", "vowel"),        # bed
     # eSpeak turns a lone "I" into "i", so render "It" and keep only the vowel
-    "ih": ("It", "vowel", "head"),  # sit
+    "ih": ("It", "vowel"),       # sit
     "o": ("0", "vowel"),         # hot
     "uh": ("V", "vowel"),        # cup
     # Long vowels and diphthongs
@@ -157,8 +152,7 @@ def decode(path: Path, sample_rate: int) -> list[float]:
     # eSpeak renders some consonants 30 dB quieter than vowels.
     threshold = peak * 0.03
     start = next(i for i, sample in enumerate(samples) if abs(sample) >= threshold)
-    end = len(samples) - next(i for i, sample in enumerate(reversed(samples)) if abs(sample) >= threshold)
-    return samples[start:end]
+    return samples[start:]
 
 
 def shape(samples: list[float], kind: str, sample_rate: int) -> list[float]:
@@ -201,17 +195,11 @@ def render_clips(voice: str, pitch: int | None, sample_rate: int) -> dict[str, l
         (data / "voices" / "!v" / "speakingkeyboard").write_text(variant)
 
         clips = {}
-        for name, (phonemes, kind, *options) in CLIPS.items():
+        for name, (phonemes, kind) in CLIPS.items():
             source = work_path / f"{name}.wav"
-            limit = sample_rate * KINDS[kind][0] // 1000
-            samples: list[float] = []
-            for speed in SPEEDS:
-                run("espeak-ng", f"--path={work_path}", "-v", "en-us+speakingkeyboard",
-                    "-s", str(speed), "-w", str(source), f"[[{phonemes}]]")
-                samples = decode(source, sample_rate)
-                if "head" in options or len(samples) <= limit * 1.1:
-                    break
-            clips[name] = shape(samples, kind, sample_rate)
+            run("espeak-ng", f"--path={work_path}", "-v", "en-us+speakingkeyboard",
+                "-w", str(source), f"[[{phonemes}]]")
+            clips[name] = shape(decode(source, sample_rate), kind, sample_rate)
             if not clips[name]:
                 sys.exit(f"eSpeak NG produced no audio for '{name}' ([[{phonemes}]]).")
         return clips
