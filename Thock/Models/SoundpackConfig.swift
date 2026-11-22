@@ -5,6 +5,8 @@ struct SoundpackConfig: Decodable {
     let metadata: SoundpackConfigMetadata
     let license: License
     let sounds: [String: KeySound]
+    /// Optional sounds for key sequences, keyed by key names separated by spaces ("t h")
+    let sequences: [String: SequenceSound]?
 }
 
 struct SoundpackConfigMetadata: Decodable {
@@ -36,4 +38,9 @@ struct License: Decodable {
 struct KeySound: Decodable {
     let down: [String]
     let up: [String]
+}
+
+struct SequenceSound: Decodable {
+    /// Played when the last key of the sequence goes down. Empty keeps that key silent.
+    let down: [String]
 }

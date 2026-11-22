@@ -4,8 +4,13 @@ import OSLog
 class SoundpackConfigManager {
     static let shared = SoundpackConfigManager()
     
-    private var keyboardConfig: SoundpackConfig?
+    private var keyboardConfig: SoundpackConfig? {
+        didSet { keyboardConfigVersion &+= 1 }
+    }
     private var mouseConfig: SoundpackConfig?
+    
+    /// Changes whenever the keyboard config is loaded or cleared, so state derived from it can be rebuilt
+    private(set) var keyboardConfigVersion = 0
     
     private init() {}
     
@@ -33,6 +38,10 @@ class SoundpackConfigManager {
         return keyboardConfig?.sounds[key]?.up
         ?? keyboardConfig?.sounds[KeyMapper.keyCodeNotFound]?.up
         ?? []
+    }
+    
+    func getKeySequences() -> [String: [String]] {
+        return keyboardConfig?.sequences?.mapValues(\.down) ?? [:]
     }
     
     // MARK: - Mouse

@@ -10,6 +10,8 @@ final class SoundManager {
     
     /// Serial queue for playback requests from the event taps, play() is not safe to run concurrently
     static let playbackQueue = DispatchQueue(label: "com.thock.playback", qos: .userInteractive)
+    /// Long enough to avoid a click, short enough that the replaced sound doesn't smear into the next
+    static let cutFadeDuration: TimeInterval = 0.005
     
     // MARK: - Constants
     private static let defaultDeviceUID = "default"
@@ -117,6 +119,9 @@ final class SoundManager {
         let mono: [Float]?
         let source: VolumeLevels.Source
         let position: SoundPosition?
+        /// Output frames left in a requested fade-out, nil while playing normally. Guarded by activeSoundsLock.
+        var fadeFramesRemaining: Int?
+        var fadeLength: Int = 1
 
         init(sound: PCMSound, rate: Double, step: Double, latencyId: UUID?, gains: (left: Float, right: Float), bus: Int?, mono: [Float]?, source: VolumeLevels.Source, position: SoundPosition?) {
             self.sound = sound
@@ -131,7 +136,7 @@ final class SoundManager {
         }
 
         var isFinished: Bool {
-            sourcePosition >= Double(sound.frameCount)
+            sourcePosition >= Double(sound.frameCount) || fadeFramesRemaining == 0
         }
     }
     
@@ -443,7 +448,8 @@ final class SoundManager {
         // Immediate Stop can return pending buffers through render callbacks. Detach
         // voices first so those callbacks cannot consume the one we intend to retain.
         activeSoundsLock.lock()
-        let latestSound = preservingLatestSound ? activeSounds.last : nil
+        // A voice being faded out was replaced on purpose and must not come back at full level
+        let latestSound = preservingLatestSound ? activeSounds.last(where: { $0.fadeFramesRemaining == nil }) : nil
         activeSounds.removeAll()
         activeSoundsLock.unlock()
         // Never hold the callback's lock across synchronous CoreAudio teardown.
@@ -835,29 +841,34 @@ final class SoundManager {
                 completeLatencyMeasurement(sound.latencyId)
             }
             
+            // The ramp spans several blocks at small buffer sizes, so its progress lives on the voice
+            let fade = sound.fadeFramesRemaining.map { (remaining: $0, length: sound.fadeLength) }
+            
             if let bus = sound.bus, let mono = sound.mono, let renderer {
                 // Apply the source level before spatial mixing; master scales the shared output
                 let sourceGain = currentLevels.sourceGain(for: sound.source)
-                _ = mono.withUnsafeBufferPointer { pcm in
+                let written = mono.withUnsafeBufferPointer { pcm in
                     Resampler.mix(
                         source: pcm, channels: 1, frameCount: sound.sound.frameCount,
                         position: &sound.sourcePosition, rate: sound.step,
                         into: renderer.busInput(bus), outChannels: 1, outFrames: frameCount,
-                        gains: (sourceGain, sourceGain)
+                        gains: (sourceGain, sourceGain), fade: fade
                     )
                 }
+                if let fade { sound.fadeFramesRemaining = fade.remaining - written }
                 if sound.isFinished {
                     renderer.releaseBus(bus)
                 }
             } else {
-                _ = sound.sound.data.withUnsafeBufferPointer { pcm in
+                let written = sound.sound.data.withUnsafeBufferPointer { pcm in
                     Resampler.mix(
                         source: pcm, channels: Int(channelCount), frameCount: sound.sound.frameCount,
                         position: &sound.sourcePosition, rate: sound.step,
                         into: outputBuffer, outChannels: Int(channelCount), outFrames: frameCount,
-                        gains: (sound.gains.left * currentVolume, sound.gains.right * currentVolume)
+                        gains: (sound.gains.left * currentVolume, sound.gains.right * currentVolume), fade: fade
                     )
                 }
+                if let fade { sound.fadeFramesRemaining = fade.remaining - written }
             }
         }
         
@@ -940,7 +951,8 @@ final class SoundManager {
     
     // MARK: - Public API
     
-    func play(sound name: String, pitchVariation: Float = 0.0, latencyId: UUID? = nil, position: SoundPosition? = nil) {
+    @discardableResult
+    func play(sound name: String, pitchVariation: Float = 0.0, latencyId: UUID? = nil, position: SoundPosition? = nil) -> ActiveSound? {
         // Keep the readiness check, restart, and voice admission atomic with idle stop/replacement.
         audioLifecycleLock.lock()
         defer { audioLifecycleLock.unlock() }
@@ -950,12 +962,12 @@ final class SoundManager {
         
         guard ready else {
             Logger.audio.warning("Playback blocked: audio system not ready")
-            return
+            return nil
         }
         
         guard let pcmSound = soundLibrary[name] else {
             Logger.audio.warning("Sound file not found: '\(name)'")
-            return
+            return nil
         }
         
         // Restart queue if stopped due to idle timeout
@@ -970,19 +982,42 @@ final class SoundManager {
             resetIdleTimer()
         } else {
             Logger.audio.debug("Playback blocked: audio system became not ready during play()")
-            return
+            return nil
         }
         
         if ENABLE_LATENCY_MEASUREMENT {
             recordLatencyCheckpoint(latencyId, point: .bufferScheduling)
         }
         
-        enqueue(pcmSound, pitchVariation: pitchVariation, latencyId: latencyId, position: position, source: .keyboard)
+        return enqueue(pcmSound, pitchVariation: pitchVariation, latencyId: latencyId, position: position, source: .keyboard)
+    }
+    
+    /// Fades a voice to silence over a few milliseconds and then drops it, so another sound can take
+    /// its place without a click. Safe to call with a voice that already finished or was discarded.
+    func fadeOut(_ voice: ActiveSound, duration: TimeInterval = SoundManager.cutFadeDuration) {
+        audioLifecycleLock.lock()
+        let deviceRate = sampleRate
+        audioLifecycleLock.unlock()
+        
+        activeSoundsLock.lock()
+        defer { activeSoundsLock.unlock() }
+        guard voice.fadeFramesRemaining == nil, !voice.isFinished else { return }
+        // A voice that hasn't reached the output yet has nothing to ramp down from
+        let frames = voice.sourcePosition == 0 ? 0 : max(1, Int((duration * deviceRate).rounded()))
+        voice.fadeLength = max(1, frames)
+        voice.fadeFramesRemaining = frames
+    }
+    
+    var activeVoiceCount: Int {
+        activeSoundsLock.lock()
+        defer { activeSoundsLock.unlock() }
+        return activeSounds.count
     }
 
     /// Creates a voice with a random pitch offset in [-variation, +variation] and starts it on the next callback
+    @discardableResult
     func enqueue(_ pcmSound: PCMSound, pitchVariation: Float, latencyId: UUID?, position: SoundPosition?, source: VolumeLevels.Source,
-                         playbackRate: Double? = nil) {
+                         playbackRate: Double? = nil) -> ActiveSound {
         // Queue replacement also rebuilds spatial routing. Serialize voice admission
         // with it so a request cannot retain a bus from the replaced renderer.
         audioLifecycleLock.lock()
@@ -1005,11 +1040,13 @@ final class SoundManager {
         let route = SpatialMath.route(position: position, spatialEnabled: spatialEnabled, outputKind: outputKind) {
             mono == nil ? nil : renderer?.acquireBus(position: $0)
         }
-        activeSounds.append(ActiveSound(sound: pcmSound, rate: rate, step: step, latencyId: latencyId,
-                                        gains: route.gains, bus: route.bus, mono: route.bus == nil ? nil : mono,
-                                        source: source, position: position))
+        let voice = ActiveSound(sound: pcmSound, rate: rate, step: step, latencyId: latencyId,
+                                gains: route.gains, bus: route.bus, mono: route.bus == nil ? nil : mono,
+                                source: source, position: position)
+        activeSounds.append(voice)
         activeSoundsLock.unlock()
         schedulePlaybackProgressCheck()
+        return voice
     }
     
     func preloadSounds(for soundpack: Soundpack) {
