@@ -31,4 +31,31 @@ struct SoundRenderingTests {
         #expect(retained.latencyId == latencyID)
         #expect(retained.sourcePosition == 0)
     }
+
+    @Test func soundsRecordedBelowTheDeviceRateAreStretchedToKeepTheirDuration() {
+        // The offline manager renders at 44.1 kHz, so a 22.05 kHz sound must last twice its frame count
+        let manager = SoundManager(audioOutputEnabled: false)
+        let halfRate = SoundManager.PCMSound(data: Array(repeating: 0.8, count: 32), frameCount: 16, sampleRate: 22_050)
+        manager.enqueue(halfRate, pitchVariation: 0, latencyId: nil, position: nil, source: .keyboard)
+
+        var output = [Float](repeating: 0, count: 96)
+        output.withUnsafeMutableBufferPointer {
+            manager.renderSamples(into: $0.baseAddress!, frameCount: 48)
+        }
+        #expect(output[..<64].allSatisfy { $0 > 0 })
+        #expect(output[64...].allSatisfy { $0 == 0 })
+    }
+
+    @Test func soundsWithoutARecordedRatePlayFrameForFrame() {
+        let manager = SoundManager(audioOutputEnabled: false)
+        let sound = SoundManager.PCMSound(data: Array(repeating: 0.8, count: 32), frameCount: 16)
+        manager.enqueue(sound, pitchVariation: 0, latencyId: nil, position: nil, source: .keyboard)
+
+        var output = [Float](repeating: 0, count: 96)
+        output.withUnsafeMutableBufferPointer {
+            manager.renderSamples(into: $0.baseAddress!, frameCount: 48)
+        }
+        #expect(output[..<32].allSatisfy { $0 > 0 })
+        #expect(output[32...].allSatisfy { $0 == 0 })
+    }
 }
