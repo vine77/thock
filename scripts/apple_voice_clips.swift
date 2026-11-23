@@ -1,15 +1,16 @@
-// Renders IPA strings with a built-in macOS voice, one audio file per clip. Used by phoneme_soundpack.py.
+// Renders clips with a built-in macOS voice, one audio file per clip. Used by the soundpack scripts.
 //
-//   apple_voice_clips <voice identifier> <output folder> <name>=<ipa> ...
+//   apple_voice_clips <voice identifier> <output folder> <clip> ...
 //
-// Each clip is written as <name>.caf. Only some voices honour IPA (Samantha and Daniel do); the
-// rest read the placeholder letter aloud instead.
+// A clip is <name>=<ipa> to speak exact phonemes or <name>:<text> to read ordinary text, and is
+// written as <name>.caf. Only some voices honour IPA (Samantha and Daniel do); the rest read a
+// placeholder letter aloud instead.
 
 import AVFoundation
 
 let arguments = CommandLine.arguments
 guard arguments.count >= 4 else {
-    FileHandle.standardError.write(Data("usage: apple_voice_clips <voice identifier> <output folder> <name>=<ipa> ...\n".utf8))
+    FileHandle.standardError.write(Data("usage: apple_voice_clips <voice identifier> <output folder> <name>=<ipa>|<name>:<text> ...\n".utf8))
     exit(64)
 }
 guard let voice = AVSpeechSynthesisVoice(identifier: arguments[1]) else {
@@ -24,16 +25,23 @@ var lastProgress = Date()
 
 func renderNext() {
     guard !pending.isEmpty else { exit(0) }
-    let parts = pending.removeFirst().split(separator: "=", maxSplits: 1).map(String.init)
-    guard parts.count == 2 else {
-        FileHandle.standardError.write(Data("Expected <name>=<ipa>, got '\(parts.joined(separator: "="))'.\n".utf8))
+    let request = pending.removeFirst()
+    guard let separator = request.firstIndex(where: { $0 == "=" || $0 == ":" }), separator != request.startIndex else {
+        FileHandle.standardError.write(Data("Expected <name>=<ipa> or <name>:<text>, got '\(request)'.\n".utf8))
         exit(64)
     }
-    // The IPA attribute replaces how the text is spoken, so the text itself is only a placeholder
-    let text = NSMutableAttributedString(string: "x")
-    text.addAttribute(NSAttributedString.Key(AVSpeechSynthesisIPANotationAttribute), value: parts[1],
-                      range: NSRange(location: 0, length: 1))
-    let utterance = AVSpeechUtterance(attributedString: text)
+    let name = String(request[..<separator])
+    let content = String(request[request.index(after: separator)...])
+    let utterance: AVSpeechUtterance
+    if request[separator] == "=" {
+        // The IPA attribute replaces how the text is spoken, so the text itself is only a placeholder
+        let text = NSMutableAttributedString(string: "x")
+        text.addAttribute(NSAttributedString.Key(AVSpeechSynthesisIPANotationAttribute), value: content,
+                          range: NSRange(location: 0, length: 1))
+        utterance = AVSpeechUtterance(attributedString: text)
+    } else {
+        utterance = AVSpeechUtterance(string: content)
+    }
     utterance.voice = voice
 
     var file: AVAudioFile?
@@ -52,7 +60,7 @@ func renderNext() {
             return
         }
         if file == nil {
-            file = try? AVAudioFile(forWriting: outputFolder.appendingPathComponent("\(parts[0]).caf"),
+            file = try? AVAudioFile(forWriting: outputFolder.appendingPathComponent("\(name).caf"),
                                     settings: pcm.format.settings, commonFormat: pcm.format.commonFormat,
                                     interleaved: pcm.format.isInterleaved)
         }

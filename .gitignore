@@ -3,3 +3,4 @@
 xcuserdata/
 DerivedData/
 *.profraw
+__pycache__/

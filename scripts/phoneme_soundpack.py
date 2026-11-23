@@ -124,6 +124,11 @@ PHONEMES = {
 }
 
 
+# The macOS voices stretch an IPA diphthong into two separate vowels, so the one this pack needs
+# is read as a word instead.
+APPLE_WORDS = {"eye": "eye"}
+
+
 class Clip(NamedTuple):
     phoneme: str
     kind: str
@@ -212,8 +217,7 @@ def decode(path: Path, sample_rate: int) -> list[float]:
     return samples[start:]
 
 
-def shape(samples: list[float], kind: str, sample_rate: int) -> list[float]:
-    spec = KINDS[kind]
+def shape(samples: list[float], spec: Kind, sample_rate: int) -> list[float]:
     clip = list(samples)
     if spec.trim_tail and clip:
         threshold = max(abs(sample) for sample in clip) * 0.03
@@ -262,17 +266,18 @@ def render_espeak(voice: str, pitch: int | None, sample_rate: int, work: Path) -
     return rendered
 
 
-def render_apple(voice: str, sample_rate: int, work: Path) -> dict[str, list[float]]:
+def render_apple(voice: str, requests: dict[str, str], sample_rate: int, work: Path) -> dict[str, list[float]]:
+    """Render clips with a macOS voice. Each request is "=<ipa>" for exact phonemes or ":<text>" for ordinary text."""
     tool = work / "apple_voice_clips"
     run("swiftc", "-O", str(Path(__file__).with_name("apple_voice_clips.swift")), "-o", str(tool))
     clips = work / "clips"
     clips.mkdir()
     try:
-        run(str(tool), APPLE_VOICES[voice], str(clips), *(f"{name}={ipa}" for name, (_, ipa) in PHONEMES.items()))
+        run(str(tool), APPLE_VOICES[voice], str(clips), *(f"{name}{request}" for name, request in requests.items()))
     except subprocess.CalledProcessError as error:
         sys.exit(error.stderr.decode().strip() or f"Rendering the '{voice}' voice failed.")
     rendered = {}
-    for name in PHONEMES:
+    for name in requests:
         source = clips / f"{name}.caf"
         rendered[name] = decode(source, sample_rate) if source.exists() else []
     return rendered
@@ -282,12 +287,17 @@ def render_clips(voice: str, pitch: int | None, sample_rate: int) -> dict[str, l
     apple = voice in APPLE_VOICES
     with tempfile.TemporaryDirectory() as work:
         work_path = Path(work)
-        rendered = render_apple(voice, sample_rate, work_path) if apple else render_espeak(voice, pitch, sample_rate, work_path)
+        if apple:
+            requests = {name: f"={ipa}" for name, (_, ipa) in PHONEMES.items()}
+            requests.update({name: f":{word}" for name, word in APPLE_WORDS.items()})
+            rendered = render_apple(voice, requests, sample_rate, work_path)
+        else:
+            rendered = render_espeak(voice, pitch, sample_rate, work_path)
     silent = sorted(name for name, samples in rendered.items() if not samples)
     if silent:
         sys.exit(f"The '{voice}' voice produced no audio for: {', '.join(silent)}.")
     return {
-        name: shape(rendered[clip.phoneme], (clip.apple_kind if apple else None) or clip.kind, sample_rate)
+        name: shape(rendered[clip.phoneme], KINDS[(clip.apple_kind if apple else None) or clip.kind], sample_rate)
         for name, clip in CLIPS.items()
     }
 
@@ -311,6 +321,15 @@ def build_config(voice: str, name: str, author: str) -> dict:
         "sounds": {key: {"down": files(clip), "up": []} for key, clip in KEYS.items()},
         "sequences": {keys: {"down": files(clip)} for keys, clip in SEQUENCES.items()},
     }
+
+
+def write_pack(output: Path, clips: dict[str, list[float]], config: dict, sample_rate: int) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    for stale in output.glob("*.wav"):
+        stale.unlink()
+    for clip, samples in clips.items():
+        write_wav(output / f"{clip}.wav", samples, sample_rate)
+    (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
 def main() -> None:
@@ -337,12 +356,7 @@ def main() -> None:
     name = args.name or f"Speaking Keyboard ({args.voice.capitalize()})"
     clips = render_clips(args.voice, args.pitch, args.sample_rate)
 
-    output.mkdir(parents=True, exist_ok=True)
-    for stale in output.glob("*.wav"):
-        stale.unlink()
-    for clip, samples in clips.items():
-        write_wav(output / f"{clip}.wav", samples, args.sample_rate)
-    (output / "config.json").write_text(json.dumps(build_config(args.voice, name, args.author), indent=2) + "\n")
+    write_pack(output, clips, build_config(args.voice, name, args.author), args.sample_rate)
 
     pitch = f", {args.pitch} Hz monotone" if args.pitch else ""
     print(f"Wrote {len(clips)} clips ({args.voice}{pitch}, {args.sample_rate} Hz) to {output}")
