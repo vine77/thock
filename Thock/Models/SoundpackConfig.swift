@@ -40,6 +40,12 @@ struct License: Decodable {
 struct KeySound: Decodable {
     let down: [String]
     let up: [String]
+    /// Optional key-down sounds for when shift is held, so ";" and ":" can sound different
+    let shifted: [String]?
+    
+    func downSounds(shifted isShifted: Bool) -> [String] {
+        return isShifted ? shifted ?? down : down
+    }
 }
 
 struct MonophonicPlayback: Decodable {

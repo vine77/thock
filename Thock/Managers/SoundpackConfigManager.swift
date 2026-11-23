@@ -28,8 +28,8 @@ class SoundpackConfigManager {
         return keyboardConfig?.metadata.supportsKeyUp ?? false
     }
     
-    func getKeyDownSounds(for key: String) -> [String] {
-        return keyboardConfig?.sounds[key]?.down
+    func getKeyDownSounds(for key: String, shifted: Bool = false) -> [String] {
+        return keyboardConfig?.sounds[key]?.downSounds(shifted: shifted)
         ?? keyboardConfig?.sounds[KeyMapper.keyCodeNotFound]?.down
         ?? []
     }

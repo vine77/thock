@@ -59,8 +59,10 @@ final class SoundEngine {
         
         // Map key code to key type and get appropriate sounds
         let keyType = KeyMapper.fromKeyCode(keyCode)
+        // Keypad keys share names with the main keys but shift doesn't change what they type
+        let shifted = flags.contains(.maskShift) && !flags.contains(.maskNumericPad)
         var keySoundList = isKeyDown
-        ? SoundpackEngine.shared.getKeyDownSounds(for: keyType)
+        ? SoundpackEngine.shared.getKeyDownSounds(for: keyType, shifted: shifted)
         : SoundpackEngine.shared.getKeyUpSounds(for: keyType)
         
         var tracksVoice = false

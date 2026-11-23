@@ -70,8 +70,8 @@ final class SoundpackEngine {
     
     // MARK: - Sound Lookups
     
-    func getKeyDownSounds(for key: String) -> [String] {
-        return SoundpackConfigManager.shared.getKeyDownSounds(for: key)
+    func getKeyDownSounds(for key: String, shifted: Bool = false) -> [String] {
+        return SoundpackConfigManager.shared.getKeyDownSounds(for: key, shifted: shifted)
     }
     
     func getKeyUpSounds(for key: String) -> [String] {

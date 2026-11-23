@@ -11,6 +11,8 @@ The voice is a built-in macOS one, so this needs `swiftc` (Xcode command line to
     python3 scripts/spelling_soundpack.py                # Samantha, installed into Thock
     python3 scripts/spelling_soundpack.py --modifiers    # also name shift, command, option...
     python3 scripts/spelling_soundpack.py --output ./pack
+
+Shifted digits and punctuation say the symbol they type on a US layout ("colon", "question mark").
 """
 
 import argparse
@@ -43,6 +45,15 @@ WORDS.update({
 })
 WORDS.update({f"f{n}": f"F {n}" for n in range(1, 13)})
 
+# What a key says while shift is held, on a US layout. Capital letters keep the plain letter name.
+SHIFTED = {
+    "1": "exclamation point", "2": "at", "3": "hash", "4": "dollar", "5": "percent", "6": "caret",
+    "7": "ampersand", "8": "star", "9": "left paren", "0": "right paren",
+    "-": "underscore", "=": "plus", "[": "left brace", "]": "right brace", "\\": "pipe",
+    ";": "colon", "'": "double quote", ",": "less than", ".": "greater than", "/": "question mark",
+    "`": "tilde",
+}
+
 # Off by default: shift would speak before every capital and command before every shortcut
 MODIFIERS = {
     "shiftLeft": "shift", "shiftRight": "shift", "command": "command", "ctrlLeft": "control",
@@ -52,6 +63,13 @@ MODIFIERS = {
 
 def clip_name(text: str) -> str:
     return text.lower().replace(" ", "-")
+
+
+def key_sound(clip: str, shifted: str | None) -> dict:
+    sound = {"down": [f"{clip}.wav"], "up": []}
+    if shifted:
+        sound["shifted"] = [f"{clip_name(shifted)}.wav"]
+    return sound
 
 
 def main() -> None:
@@ -71,7 +89,7 @@ def main() -> None:
 
     words = {**WORDS, **(MODIFIERS if args.modifiers else {})}
     keys = {key: clip_name(text) for key, text in words.items()}
-    requests = {clip_name(text): f":{text}" for text in words.values()}
+    requests = {clip_name(text): f":{text}" for text in (*words.values(), *SHIFTED.values())}
 
     with tempfile.TemporaryDirectory() as work:
         rendered = render_apple(args.voice, requests, args.sample_rate, Path(work))
@@ -92,7 +110,7 @@ def main() -> None:
         "license": {"type": "unknown", "url": ""},
         "monophonic": {"fadeMs": CUT_FADE_MS},
         # No "default" entry: keys without a name here stay silent
-        "sounds": {key: {"down": [f"{clip}.wav"], "up": []} for key, clip in keys.items()},
+        "sounds": {key: key_sound(clip, SHIFTED.get(key)) for key, clip in keys.items()},
     }
     output = args.output or SOUNDPACKS / f"spelling-keyboard-{args.voice}"
     write_pack(output, clips, config, args.sample_rate)
