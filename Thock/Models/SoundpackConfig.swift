@@ -7,6 +7,8 @@ struct SoundpackConfig: Decodable {
     let sounds: [String: KeySound]
     /// Optional sounds for key sequences, keyed by key names separated by spaces ("t h")
     let sequences: [String: SequenceSound]?
+    /// When present, the pack sounds one key at a time: each key-down fades out the one before it
+    let monophonic: MonophonicPlayback?
 }
 
 struct SoundpackConfigMetadata: Decodable {
@@ -38,6 +40,22 @@ struct License: Decodable {
 struct KeySound: Decodable {
     let down: [String]
     let up: [String]
+}
+
+struct MonophonicPlayback: Decodable {
+    static let defaultFadeMs = 20.0
+    
+    /// How long the previous key's sound takes to fade out, in milliseconds
+    let fadeMs: Double
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        fadeMs = max(0, try container.decodeIfPresent(Double.self, forKey: .fadeMs) ?? Self.defaultFadeMs)
+    }
+    
+    private enum CodingKeys: String, CodingKey {
+        case fadeMs
+    }
 }
 
 struct SequenceSound: Decodable {

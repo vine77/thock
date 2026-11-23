@@ -44,6 +44,11 @@ class SoundpackConfigManager {
         return keyboardConfig?.sequences?.mapValues(\.down) ?? [:]
     }
     
+    /// Fade-out time for the previous key's sound, or nil when the pack lets key sounds overlap
+    func getMonophonicFade() -> TimeInterval? {
+        return keyboardConfig?.monophonic.map { $0.fadeMs / 1000 }
+    }
+    
     // MARK: - Mouse
     
     func loadMouseConfig(for soundpack: Soundpack) {

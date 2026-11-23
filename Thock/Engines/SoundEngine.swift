@@ -22,6 +22,8 @@ final class SoundEngine {
     private var sequenceConfigVersion: Int?
     /// Voices of the most recent sequence-eligible key-downs, oldest first; nil-backed when a key was silent
     private var recentVoices: [WeakVoice] = []
+    /// The key-down voice still sounding in a monophonic soundpack
+    private var soloVoice = WeakVoice()
     
     // MARK: - Initialization
     
@@ -79,16 +81,28 @@ final class SoundEngine {
             }
         }
         
+        let soloFade = isKeyDown ? SoundpackConfigManager.shared.getMonophonicFade() : nil
+        
         // Play random sound from the list
         var voice: SoundManager.ActiveSound?
         if let soundFileName = keySoundList.randomElement() {
             recordLatencyCheckpoint(latencyId, point: .soundSelected)
-            for replaced in voicesToCut {
-                if let replaced = replaced.voice {
-                    SoundManager.shared.fadeOut(replaced)
+            if let soloFade {
+                // Every earlier key of a sequence was already cut by the key after it
+                if let previous = soloVoice.voice {
+                    SoundManager.shared.fadeOut(previous, duration: soloFade)
+                }
+            } else {
+                for replaced in voicesToCut {
+                    if let replaced = replaced.voice {
+                        SoundManager.shared.fadeOut(replaced)
+                    }
                 }
             }
             voice = play(sound: soundFileName, latencyId: latencyId, position: KeyLayout.position(for: keyCode, width: SettingsEngine.shared.getSpatialWidth(), layout: layout))
+            if soloFade != nil {
+                soloVoice = WeakVoice(voice: voice)
+            }
         }
         
         if tracksVoice {

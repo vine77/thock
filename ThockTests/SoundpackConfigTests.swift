@@ -18,6 +18,7 @@ struct SoundpackConfigTests {
     @Test func aConfigWithoutSequencesStillDecodes() throws {
         let config = try decode()
         #expect(config.sequences == nil)
+        #expect(config.monophonic == nil)
         #expect(config.sounds["a"]?.down == ["a.wav"])
     }
 
@@ -25,5 +26,10 @@ struct SoundpackConfigTests {
         let config = try decode(extra: #", "sequences": { "t h": { "down": ["th_1.wav", "th_2.wav"] }, "c k": { "down": [] } }"#)
         #expect(config.sequences?["t h"]?.down == ["th_1.wav", "th_2.wav"])
         #expect(config.sequences?["c k"]?.down == [])
+    }
+
+    @Test func monophonicDecodesItsFadeAndDefaultsIt() throws {
+        #expect(try decode(extra: #", "monophonic": { "fadeMs": 35 }"#).monophonic?.fadeMs == 35)
+        #expect(try decode(extra: #", "monophonic": {}"#).monophonic?.fadeMs == MonophonicPlayback.defaultFadeMs)
     }
 }
