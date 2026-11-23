@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
 Build a "speaking keyboard" soundpack: every letter key plays the sound that letter most often
-makes in English, and letter pairs such as "th", "sh" and "ee" play their own sound through the
-soundpack "sequences" feature.
+makes in English, and letter pairs such as "th", "sh" and "ow" are completed by their second key.
 
-The clips are rendered with eSpeak NG. Requires `espeak-ng` and `ffmpeg` on PATH
-(brew install espeak-ng ffmpeg).
+The pack is monophonic ("legato"): each key fades out the sound before it, so vowels are recorded
+at full length and simply last until the next key. It relies on the soundpack "monophonic" and
+"sequences" features, so it needs this fork of Thock; stock Thock would play the letters only and
+let the long vowels ring over each other.
 
-    python3 scripts/phoneme_soundpack.py                    # install into Thock's custom soundpacks
-    python3 scripts/phoneme_soundpack.py --voice robosoft --pitch 80   # monotone at 80 Hz
-    python3 scripts/phoneme_soundpack.py --output ./pack    # write somewhere else
+Voices come from eSpeak NG (brew install espeak-ng) or from the built-in macOS voices (needs
+`swiftc` from the Xcode command line tools). Both need `ffmpeg` on PATH.
+
+    python3 scripts/phoneme_soundpack.py                     # eSpeak Klatt4, installed into Thock
+    python3 scripts/phoneme_soundpack.py --voice samantha    # macOS Samantha
+    python3 scripts/phoneme_soundpack.py --voice klatt --pitch 80   # eSpeak monotone at 80 Hz
+    python3 scripts/phoneme_soundpack.py --output ./pack     # write somewhere else
 """
 
 import argparse
@@ -21,16 +26,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import wave
 from pathlib import Path
+from typing import NamedTuple
 
-# Regenerating the pack keeps this id, so Thock keeps it selected.
-PACK_ID = "9B3E5D52-7C1F-4E0A-B8D6-2F4A61C0E7A3"
+# Each voice gets a stable id derived from this one, so regenerating a pack keeps it selected in Thock.
+PACK_NAMESPACE = uuid.UUID("9B3E5D52-7C1F-4E0A-B8D6-2F4A61C0E7A3")
 
-DEFAULT_OUTPUT = Path.home() / "Library/Application Support/Thock/Soundpacks/speaking-keyboard"
+SOUNDPACKS = Path.home() / "Library/Application Support/Thock/Soundpacks"
+
+# How long the previous key's sound takes to fade out when the next key cuts it
+CUT_FADE_MS = 20
 
 # eSpeak voice variants.
-VOICES = {
+ESPEAK_VOICES = {
     "plain": "",
     "klatt": "klatt 1\n",
     "klatt4": "klatt 4\n",
@@ -50,56 +60,101 @@ VOICES = {
     ),
 }
 
-# kind -> (longest clip in ms, fade-out in ms, level, how the level is measured)
-# Stops are bursts with almost no energy, so they are matched by peak instead of RMS.
-KINDS = {
-    "vowel": (130, 20, 0.12, "rms"),
-    "long": (170, 25, 0.12, "rms"),
-    "glide": (190, 25, 0.12, "rms"),
-    "sonorant": (100, 15, 0.10, "rms"),
-    "fricative": (100, 12, 0.06, "rms"),
-    "voiced-fricative": (100, 15, 0.08, "rms"),
-    "affricate": (110, 12, 0.07, "rms"),
-    "stop": (70, 8, 0.45, "peak"),
-    "voiced-stop": (90, 15, 0.10, "rms"),
-    "cluster": (140, 12, 0.45, "peak"),
+# macOS voices that honour IPA input. List identifiers with:
+#   swift -e 'import AVFoundation; AVSpeechSynthesisVoice.speechVoices().forEach { print($0.identifier) }'
+APPLE_VOICES = {
+    "samantha": "com.apple.voice.compact.en-US.Samantha",
 }
 
-# clip name -> (eSpeak phoneme mnemonics, kind)
-# Verify a mnemonic with: espeak-ng -v en-us --ipa -q "[[tS]]"
-CLIPS = {
-    # Short vowels
-    "ae": ("a", "vowel"),        # cat
-    "eh": ("E", "vowel"),        # bed
+
+class Kind(NamedTuple):
+    max_ms: int
+    fade_ms: int
+    level: float
+    # Stops are bursts with almost no energy, so they are matched by peak instead of RMS
+    measure: str = "rms"
+    # Sustained sounds run to their natural end, so the silence after it has to go before the fade
+    trim_tail: bool = False
+
+
+KINDS = {
+    # Full-length vowels: the next key decides how long they are heard
+    "sustained": Kind(320, 40, 0.12, trim_tail=True),
+    "sustained-diphthong": Kind(450, 40, 0.12, trim_tail=True),
+    # eSpeak's short "i" is the start of "it", so it has to stop before the "t"
+    "sustained-checked": Kind(140, 40, 0.12, trim_tail=True),
+    # The second half of a diphthong, added by the second key of a pair such as "ow"
+    "glide": Kind(130, 20, 0.12),
+    "long-glide": Kind(170, 25, 0.12),
+    "sonorant": Kind(100, 15, 0.10),
+    "fricative": Kind(100, 12, 0.06),
+    "voiced-fricative": Kind(100, 15, 0.08),
+    "affricate": Kind(110, 12, 0.07),
+    "stop": Kind(70, 8, 0.45, measure="peak"),
+    "voiced-stop": Kind(90, 15, 0.10),
+    "cluster": Kind(140, 12, 0.45, measure="peak"),
+}
+
+# phoneme -> (eSpeak mnemonics, IPA for macOS voices)
+# Verify an eSpeak mnemonic with: espeak-ng -v en-us --ipa -q "[[tS]]"
+# The macOS voices drop "ɹ", "ɡ" (the IPA letter) and "ɝ"; they want plain "r" and "g".
+PHONEMES = {
+    "ae": ("a", "æ"),            # cat
+    "eh": ("E", "ɛ"),            # bed
     # eSpeak turns a lone "I" into "i", so render "It" and keep only the vowel
-    "ih": ("It", "vowel"),       # sit
-    "o": ("0", "vowel"),         # hot
-    "uh": ("V", "vowel"),        # cup
-    # Long vowels and diphthongs
-    "ee": ("i:", "long"),        # see
-    "oo": ("u:", "long"),        # moon
-    "ay": ("eI", "glide"),       # day
-    "oh": ("oU", "glide"),       # boat
-    "ow": ("aU", "glide"),       # out
-    "oy": ("OI", "glide"),       # boy
-    "eye": ("aI", "glide"),      # high
-    "ar": ("A@", "glide"),       # car
-    "er": ("3", "long"),         # her
-    "or": ("O@", "glide"),       # for
-    # Consonants
-    # eSpeak renders silence for a voiced stop on its own, so release each into a schwa
-    "b": ("b@", "voiced-stop"), "d": ("d@", "voiced-stop"), "g": ("g@", "voiced-stop"),
-    "p": ("p", "stop"), "t": ("t", "stop"), "k": ("k", "stop"),
-    "f": ("f", "fricative"), "s": ("s", "fricative"), "h": ("h", "fricative"),
-    "sh": ("S", "fricative"),                             # ship
-    # Voiced consonants are faint or silent on their own in eSpeak, so they also get a schwa
-    "v": ("v@", "voiced-fricative"), "z": ("z@", "voiced-fricative"),
-    "dh": ("D@", "voiced-fricative"),                     # the
-    "ch": ("tS", "affricate"), "j": ("dZ@", "affricate"), # chip, jam
-    "l": ("l@", "sonorant"), "m": ("m@", "sonorant"), "n": ("n@", "sonorant"),
-    "ng": ("N", "sonorant"), "r": ("r@", "sonorant"),
-    "w": ("w@", "sonorant"), "y": ("j@", "sonorant"),
-    "ks": ("ks", "cluster"),
+    "ih": ("It", "ɪ"),           # sit
+    "o": ("0", "ɑ"),             # hot
+    "uh": ("V", "ʌ"),            # cup
+    "ee": ("i:", "i"),           # see
+    "oo": ("u:", "u"),           # moon
+    "eye": ("aI", "aɪ"),         # high
+    # eSpeak renders silence for a voiced stop on its own, and other voiced consonants come out
+    # faint, so each is released into a schwa. The macOS voices need the schwa on every consonant.
+    "b": ("b@", "bə"), "d": ("d@", "də"), "g": ("g@", "gə"),
+    "p": ("p", "pə"), "t": ("t", "tə"), "k": ("k", "kə"),
+    "f": ("f", "fə"), "s": ("s", "sə"), "h": ("h", "hə"),
+    "sh": ("S", "ʃə"),                                    # ship
+    "v": ("v@", "və"), "z": ("z@", "zə"),
+    "dh": ("D@", "ðə"),                                   # the
+    "ch": ("tS", "tʃə"), "j": ("dZ@", "dʒə"),             # chip, jam
+    "l": ("l@", "lə"), "m": ("m@", "mə"), "n": ("n@", "nə"),
+    "ng": ("N", "ŋə"), "r": ("r@", "rə"),
+    "w": ("w@", "wə"), "y": ("j@", "jə"),
+    "ks": ("ks", "ksə"),
+}
+
+
+class Clip(NamedTuple):
+    phoneme: str
+    kind: str
+    # Set where a schwa-carried macOS rendering needs different shaping from the bare eSpeak one
+    apple_kind: str | None = None
+
+
+# clip file name (without ".wav") -> what it is cut from
+CLIPS = {
+    "ae": Clip("ae", "sustained"),
+    "eh": Clip("eh", "sustained"),
+    "ih": Clip("ih", "sustained-checked", "sustained"),
+    "o": Clip("o", "sustained"),
+    "uh": Clip("uh", "sustained"),
+    "ee": Clip("ee", "sustained"),
+    "oo": Clip("oo", "sustained"),
+    "eye": Clip("eye", "sustained-diphthong"),
+    "glide-ih": Clip("ih", "glide"),
+    "glide-oo": Clip("oo", "long-glide"),
+    "b": Clip("b", "voiced-stop"), "d": Clip("d", "voiced-stop"), "g": Clip("g", "voiced-stop"),
+    "p": Clip("p", "stop", "voiced-stop"), "t": Clip("t", "stop", "voiced-stop"),
+    "k": Clip("k", "stop", "voiced-stop"),
+    "f": Clip("f", "fricative", "voiced-fricative"), "s": Clip("s", "fricative", "voiced-fricative"),
+    "h": Clip("h", "fricative", "voiced-fricative"), "sh": Clip("sh", "fricative", "voiced-fricative"),
+    "v": Clip("v", "voiced-fricative"), "z": Clip("z", "voiced-fricative"),
+    "dh": Clip("dh", "voiced-fricative"),
+    "ch": Clip("ch", "affricate"), "j": Clip("j", "affricate"),
+    "l": Clip("l", "sonorant"), "m": Clip("m", "sonorant"), "n": Clip("n", "sonorant"),
+    "ng": Clip("ng", "sonorant"), "r": Clip("r", "sonorant"),
+    "w": Clip("w", "sonorant"), "y": Clip("y", "sonorant"),
+    "ks": Clip("ks", "cluster"),
 }
 
 KEYS = {
@@ -109,20 +164,22 @@ KEYS = {
 }
 
 # The first key of a sequence has already sounded by the time the sequence completes, so each
-# entry is what the *last* key should add. None keeps that key silent and cuts nothing.
+# entry is only what the *last* key still has to add. None keeps that key silent, which leaves
+# the sound before it playing.
 SEQUENCES = {
     "t h": "dh", "s h": "sh", "c h": "ch", "p h": "f", "n g": "ng",
-    # "t" then "c" is the start of "tch"; the "c" must not say /k/
-    "t c": None, "t c h": "ch",
+    # "t" then "c" is the start of "tch"; the "c" must not say /k/, and "t" plus "sh" is "ch"
+    "t c": None, "t c h": "sh",
     "w h": None, "c k": None,
     # "q" already said /k/, so "u" only adds the /w/
     "q u": "w",
     "i g h": "eye",
     "e e": "ee", "e a": "ee", "o o": "oo",
-    "a i": "ay", "a y": "ay", "o a": "oh",
-    "o u": "ow", "o w": "ow", "o i": "oy", "o y": "oy",
-    "a r": "ar", "o r": "or", "e r": "er", "i r": "er", "u r": "er",
 }
+# A diphthong is its first vowel plus a glide, and the first vowel is already playing.
+# Vowel + "r" needs no entry: the "r" key's own sound colours the vowel it cuts.
+SEQUENCES.update({keys: "glide-ih" for keys in ("a i", "a y", "o i", "o y", "e i", "e y")})
+SEQUENCES.update({keys: "glide-oo" for keys in ("o u", "o w", "a u", "a w", "e w", "o a")})
 # A doubled consonant is one sound
 SEQUENCES.update({f"{c} {c}": None for c in "bcdfgklmnprstvz"})
 
@@ -156,21 +213,26 @@ def decode(path: Path, sample_rate: int) -> list[float]:
 
 
 def shape(samples: list[float], kind: str, sample_rate: int) -> list[float]:
-    max_ms, fade_ms, level, measure = KINDS[kind]
-    clip = samples[: sample_rate * max_ms // 1000]
+    spec = KINDS[kind]
+    clip = list(samples)
+    if spec.trim_tail and clip:
+        threshold = max(abs(sample) for sample in clip) * 0.03
+        while clip and abs(clip[-1]) < threshold:
+            clip.pop()
+    clip = clip[: sample_rate * spec.max_ms // 1000]
     if not clip:
         return clip
-    fade = min(len(clip), sample_rate * fade_ms // 1000)
+    fade = min(len(clip), sample_rate * spec.fade_ms // 1000)
     for i in range(fade):
         clip[len(clip) - fade + i] *= 1.0 - (i + 1) / fade
     peak = max(abs(sample) for sample in clip)
     if peak == 0:
         return clip
-    if measure == "rms":
+    if spec.measure == "rms":
         rms = math.sqrt(sum(sample * sample for sample in clip) / len(clip))
-        gain = min(level / rms, 0.9 / peak)
+        gain = min(spec.level / rms, 0.9 / peak)
     else:
-        gain = level / peak
+        gain = spec.level / peak
     return [sample * gain for sample in clip]
 
 
@@ -183,42 +245,68 @@ def write_wav(path: Path, samples: list[float], sample_rate: int) -> None:
         output.writeframes(pcm.tobytes())
 
 
+def render_espeak(voice: str, pitch: int | None, sample_rate: int, work: Path) -> dict[str, list[float]]:
+    # A custom voice variant has to live inside an eSpeak data directory
+    data = work / "espeak-ng-data"
+    shutil.copytree(espeak_data_dir(), data)
+    # Equal base and top pitch gives a monotone; without it the voice keeps its own intonation
+    pitch_line = f"pitch {pitch} {pitch}\n" if pitch else ""
+    variant = f"language variant\nname speakingkeyboard\n{pitch_line}{ESPEAK_VOICES[voice]}"
+    (data / "voices" / "!v" / "speakingkeyboard").write_text(variant)
+
+    rendered = {}
+    for name, (mnemonics, _) in PHONEMES.items():
+        source = work / f"{name}.wav"
+        run("espeak-ng", f"--path={work}", "-v", "en-us+speakingkeyboard", "-w", str(source), f"[[{mnemonics}]]")
+        rendered[name] = decode(source, sample_rate)
+    return rendered
+
+
+def render_apple(voice: str, sample_rate: int, work: Path) -> dict[str, list[float]]:
+    tool = work / "apple_voice_clips"
+    run("swiftc", "-O", str(Path(__file__).with_name("apple_voice_clips.swift")), "-o", str(tool))
+    clips = work / "clips"
+    clips.mkdir()
+    try:
+        run(str(tool), APPLE_VOICES[voice], str(clips), *(f"{name}={ipa}" for name, (_, ipa) in PHONEMES.items()))
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.stderr.decode().strip() or f"Rendering the '{voice}' voice failed.")
+    rendered = {}
+    for name in PHONEMES:
+        source = clips / f"{name}.caf"
+        rendered[name] = decode(source, sample_rate) if source.exists() else []
+    return rendered
+
+
 def render_clips(voice: str, pitch: int | None, sample_rate: int) -> dict[str, list[float]]:
+    apple = voice in APPLE_VOICES
     with tempfile.TemporaryDirectory() as work:
         work_path = Path(work)
-        # A custom voice variant has to live inside an eSpeak data directory
-        data = work_path / "espeak-ng-data"
-        shutil.copytree(espeak_data_dir(), data)
-        # Equal base and top pitch gives a monotone; without it the voice keeps its own intonation
-        pitch_line = f"pitch {pitch} {pitch}\n" if pitch else ""
-        variant = f"language variant\nname speakingkeyboard\n{pitch_line}{VOICES[voice]}"
-        (data / "voices" / "!v" / "speakingkeyboard").write_text(variant)
-
-        clips = {}
-        for name, (phonemes, kind) in CLIPS.items():
-            source = work_path / f"{name}.wav"
-            run("espeak-ng", f"--path={work_path}", "-v", "en-us+speakingkeyboard",
-                "-w", str(source), f"[[{phonemes}]]")
-            clips[name] = shape(decode(source, sample_rate), kind, sample_rate)
-            if not clips[name]:
-                sys.exit(f"eSpeak NG produced no audio for '{name}' ([[{phonemes}]]).")
-        return clips
+        rendered = render_apple(voice, sample_rate, work_path) if apple else render_espeak(voice, pitch, sample_rate, work_path)
+    silent = sorted(name for name, samples in rendered.items() if not samples)
+    if silent:
+        sys.exit(f"The '{voice}' voice produced no audio for: {', '.join(silent)}.")
+    return {
+        name: shape(rendered[clip.phoneme], (clip.apple_kind if apple else None) or clip.kind, sample_rate)
+        for name, clip in CLIPS.items()
+    }
 
 
-def build_config(name: str, author: str) -> dict:
+def build_config(voice: str, name: str, author: str) -> dict:
     def files(clip):
         return [] if clip is None else [f"{clip}.wav"]
 
     return {
-        "id": PACK_ID,
+        "id": str(uuid.uuid5(PACK_NAMESPACE, voice)).upper(),
         "metadata": {
             "name": name,
-            "brand": "eSpeak NG",
+            "brand": "Apple" if voice in APPLE_VOICES else "eSpeak NG",
             "author": author,
             "category": "keyboard",
             "supportsKeyUp": False,
         },
         "license": {"type": "unknown", "url": ""},
+        "monophonic": {"fadeMs": CUT_FADE_MS},
         # No "default" entry: space, digits and punctuation stay silent
         "sounds": {key: {"down": files(clip), "up": []} for key, clip in KEYS.items()},
         "sequences": {keys: {"down": files(clip)} for keys, clip in SEQUENCES.items()},
@@ -227,30 +315,37 @@ def build_config(name: str, author: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--voice", choices=sorted(VOICES), default="klatt", help="eSpeak voice variant")
+    parser.add_argument("--voice", choices=sorted({**ESPEAK_VOICES, **APPLE_VOICES}), default="klatt4",
+                        help="eSpeak voice variant or macOS voice")
     parser.add_argument("--pitch", type=int, default=None,
-                        help="force one fixed pitch in Hz for a monotone (default: the voice's own intonation)")
+                        help="eSpeak only: force one fixed pitch in Hz for a monotone (default: the voice's own intonation)")
     parser.add_argument("--sample-rate", type=int, default=48000, help="sample rate of the clips")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="soundpack folder to write")
-    parser.add_argument("--name", default="Speaking Keyboard", help="soundpack name shown in Thock")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="soundpack folder to write (default: speaking-keyboard-<voice> in Thock's custom soundpacks)")
+    parser.add_argument("--name", default=None, help="soundpack name shown in Thock")
     parser.add_argument("--author", default="Unknown", help="soundpack author shown in Thock")
     args = parser.parse_args()
 
-    for tool in ("espeak-ng", "ffmpeg"):
+    apple = args.voice in APPLE_VOICES
+    if apple and args.pitch:
+        sys.exit("--pitch only applies to eSpeak voices.")
+    for tool in ("swiftc" if apple else "espeak-ng", "ffmpeg"):
         if shutil.which(tool) is None:
             sys.exit(f"`{tool}` not found on PATH.")
 
+    output = args.output or SOUNDPACKS / f"speaking-keyboard-{args.voice}"
+    name = args.name or f"Speaking Keyboard ({args.voice.capitalize()})"
     clips = render_clips(args.voice, args.pitch, args.sample_rate)
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    for stale in args.output.glob("*.wav"):
+    output.mkdir(parents=True, exist_ok=True)
+    for stale in output.glob("*.wav"):
         stale.unlink()
-    for name, samples in clips.items():
-        write_wav(args.output / f"{name}.wav", samples, args.sample_rate)
-    (args.output / "config.json").write_text(json.dumps(build_config(args.name, args.author), indent=2) + "\n")
+    for clip, samples in clips.items():
+        write_wav(output / f"{clip}.wav", samples, args.sample_rate)
+    (output / "config.json").write_text(json.dumps(build_config(args.voice, name, args.author), indent=2) + "\n")
 
-    pitch = f"{args.pitch} Hz monotone" if args.pitch else "natural pitch"
-    print(f"Wrote {len(clips)} clips ({args.voice}, {pitch}, {args.sample_rate} Hz) to {args.output}")
+    pitch = f", {args.pitch} Hz monotone" if args.pitch else ""
+    print(f"Wrote {len(clips)} clips ({args.voice}{pitch}, {args.sample_rate} Hz) to {output}")
 
 
 if __name__ == "__main__":
